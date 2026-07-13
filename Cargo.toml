@@ -1,6 +1,9 @@
-[package]
-name = "params"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "3"
+members = [
+    "params",
+    "params_macro",
+]
 
-[dependencies]
+[workspace.dependencies]
+params_macro = { path = "params_macro" }
