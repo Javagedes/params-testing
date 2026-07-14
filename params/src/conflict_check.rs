@@ -1,6 +1,17 @@
 use crate::hlist::{Cons, Nil};
 use core::marker::PhantomData;
 
+/// Read access to resource `R`.
+pub struct Read<R>(PhantomData<R>);
+
+/// Write access to resource `R`.
+pub struct Write<R>(PhantomData<R>);
+
+/// Partitioned access to resource `R` at key `K`.
+///
+/// e.g. `Read<Part<Storage, T>>` reads only the `T` region of `Storage`.
+pub struct Part<R, K>(PhantomData<(R, K)>);
+
 /// Compile-time type identity (specialization-free).
 ///
 /// Stable Rust cannot decide type *inequality* by trait resolution, so instead
@@ -110,7 +121,7 @@ pub trait HasPath {
 /// A partition `Part<R, K>` sits one level below `R`: its path is `R`'s path
 /// with the partition key appended, so it overlaps any whole-`R` access but is
 /// disjoint from partitions with a different key.
-impl<R, K> HasPath for crate::access::Part<R, K>
+impl<R, K> HasPath for Part<R, K>
 where
     R: HasPath,
     K: HasKey,
@@ -152,12 +163,12 @@ pub trait ConflictsWith<T> {
 }
 
 /// `Read` vs `Read` => two shared reads, never conflict.
-impl<A, B> ConflictsWith<crate::access::Read<B>> for crate::access::Read<A> {
+impl<A, B> ConflictsWith<Read<B>> for Read<A> {
     const VALUE: bool = false;
 }
 
 /// `Read<A>` vs `Write<B>` => conflict iff `A` and `B` overlap.
-impl<A, B> ConflictsWith<crate::access::Write<B>> for crate::access::Read<A>
+impl<A, B> ConflictsWith<Write<B>> for Read<A>
 where
     A: HasPath,
     B: HasPath,
@@ -167,7 +178,7 @@ where
 }
 
 /// `Write<A>` vs `Read<B>` => conflict iff `A` and `B` overlap.
-impl<A, B> ConflictsWith<crate::access::Read<B>> for crate::access::Write<A>
+impl<A, B> ConflictsWith<Read<B>> for Write<A>
 where
     A: HasPath,
     B: HasPath,
@@ -177,7 +188,7 @@ where
 }
 
 /// `Write<A>` vs `Write<B>` => two writes, conflict iff `A` and `B` overlap.
-impl<A, B> ConflictsWith<crate::access::Write<B>> for crate::access::Write<A>
+impl<A, B> ConflictsWith<Write<B>> for Write<A>
 where
     A: HasPath,
     B: HasPath,

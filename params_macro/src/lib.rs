@@ -1,17 +1,13 @@
-//! Derive macros for the `params` crate.
+//! Procedural macros for the `params` crate.
 //!
 //! `#[derive(Resource)]` gives a type a compile-time structural identity
 //! (the hidden `params::HasKey` + `params::HasPath` traits), derived from the
 //! type's name with every generic type parameter folded in — so `Foo<A>` and
 //! `Foo<B>` are distinct (each such parameter must itself have an identity).
 //!
-//! `#[derive(ParamAccess)]` additionally generates the `params::ParamAccess` impl from an
-//! `#[accesses(read(...), write(...))]` attribute. A param's own generic scopes any
-//! resource that doesn't already name it into a `Part<R, T>` partition.
-//!
-//! `resource_key!(i32, u32, ...)` gives external/primitive types just the
-//! identity (no `HasPath`), so they can serve as partition keys or generic
-//! arguments without a full derive.
+//! `#[accesses(read(...), write(...))]` is an attribute macro that generates the
+//! `params::Access` impl (plus the identity). A param's own generic scopes
+//! any resource that doesn't already name it into a `Part<R, T>` partition.
 
 use proc_macro::TokenStream;
 use quote::{quote, quote_spanned};
@@ -145,10 +141,10 @@ impl Parse for AccessSpec {
 /// nothing else.
 ///
 /// A resource is the *noun*; it declares no accesses of its own. It is
-/// *requested* by reference — the blanket `impl ParamAccess for &R` / `&mut R`
+/// *requested* by reference — the blanket `impl Access for &R` / `&mut R`
 /// makes `&Storage` a read and `&mut Storage` a write of it — or through a param
 /// that names it (e.g. a `Config<T>` reading a `Part<Storage, T>`). For a type
-/// that is itself a parameter, use `#[derive(ParamAccess)]` instead.
+/// that is itself a parameter, use `#[accesses(...)]` instead.
 #[proc_macro_derive(Resource)]
 pub fn derive_resource(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -156,7 +152,7 @@ pub fn derive_resource(input: TokenStream) -> TokenStream {
 }
 
 /// Marks a type as a **parameter** — something a function requests — by
-/// generating its `ParamAccess` impl (plus the identity, so a param may also be
+/// generating its `Access` impl (plus the identity, so a param may also be
 /// named or nested like a resource).
 ///
 /// A parameter is the *verb*: declare what it touches with
@@ -165,68 +161,43 @@ pub fn derive_resource(input: TokenStream) -> TokenStream {
 /// `read(Storage)` on `Config<T>` reads just the `T`-partition of `Storage`.
 /// For a plain data type that is only *accessed* (not a param), use
 /// `#[derive(Resource)]`.
-#[proc_macro_derive(ParamAccess, attributes(accesses))]
-pub fn derive_param(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
+#[proc_macro_attribute]
+pub fn accesses(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as DeriveInput);
+    let spec = parse_macro_input!(attr as AccessSpec);
     let name = &input.ident;
 
     let identity = identity_impls(&input);
-
     let generic_idents = type_param_idents(&input.generics);
 
+    // Build the `Cons`/`Nil` access list, auto-scoping each declared resource
+    // into the param's own generics (reads first, then writes).
     let mut items: Vec<proc_macro2::TokenStream> = Vec::new();
-    for attr in &input.attrs {
-        if attr.path().is_ident("accesses") {
-            let spec: AccessSpec = match attr.parse_args() {
-                Ok(spec) => spec,
-                Err(err) => return err.to_compile_error().into(),
-            };
-            for r in &spec.reads {
-                let scoped = scope(r, &generic_idents);
-                items.push(quote! { ::params::Read<#scoped> });
-            }
-            for w in &spec.writes {
-                let scoped = scope(w, &generic_idents);
-                items.push(quote! { ::params::Write<#scoped> });
-            }
-        }
+    for r in &spec.reads {
+        let scoped = scope(r, &generic_idents);
+        items.push(quote! { ::params::Read<#scoped> });
+    }
+    for w in &spec.writes {
+        let scoped = scope(w, &generic_idents);
+        items.push(quote! { ::params::Write<#scoped> });
+    }
+    let mut list = quote! { ::params::Nil };
+    for marker in items.iter().rev() {
+        list = quote! { ::params::Cons<#marker, #list> };
     }
 
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
     quote! {
+        #input
+
         #identity
 
-        impl #impl_generics ::params::ParamAccess for #name #ty_generics #where_clause {
-            type Accesses = ::params::accesses![#(#items),*];
+        impl #impl_generics ::params::Access for #name #ty_generics #where_clause {
+            type Accesses = #list;
         }
     }
     .into()
-}
-
-/// Gives external or primitive types (e.g. `i32`) a `params::HasKey` identity so
-/// they can serve as partition keys or generic arguments. Accepts a
-/// comma-separated list; each key is derived from the type's name (no numbers by
-/// hand). These get no `HasPath`, so they can't be used as resources directly —
-/// use `#[derive(Resource)]` / `#[derive(ParamAccess)]` for that.
-#[proc_macro]
-pub fn resource_key(input: TokenStream) -> TokenStream {
-    let types = parse_macro_input!(input with Punctuated::<Type, Token![,]>::parse_terminated);
-    let impls = types.iter().map(|ty| {
-        let name: String = quote! { #ty }
-            .to_string()
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        let name_hash = hash_name(&name);
-        quote! {
-            impl ::params::HasKey for #ty {
-                type Key = ::params::Sig<#name_hash, ::params::ANil>;
-            }
-        }
-    });
-
-    quote! { #(#impls)* }.into()
 }
 
 /// Compile-time assertion that a comma-separated list of params has no access
@@ -234,7 +205,7 @@ pub fn resource_key(input: TokenStream) -> TokenStream {
 /// names exactly the two that clash and points at your code.
 ///
 /// ```ignore
-/// assert_no_conflicts!(&Storage, Config<i32>, &mut Storage);
+/// assert_no_conflicts!(&Storage, Timer, &mut Storage);
 /// // error: `&Storage` and `&mut Storage` conflict: ...
 /// ```
 #[proc_macro]
