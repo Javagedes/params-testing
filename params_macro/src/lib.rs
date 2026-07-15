@@ -5,9 +5,11 @@
 //! type's name with every generic type parameter folded in — so `Foo<A>` and
 //! `Foo<B>` are distinct (each such parameter must itself have an identity).
 //!
-//! `#[accesses(read(...), write(...))]` is an attribute macro that generates the
-//! `params::Access` impl (plus the identity). A param's own generic scopes
-//! any resource that doesn't already name it into a `Part<R, T>` partition.
+//! `#[accesses(...)]` is an attribute macro that generates the `params::Access`
+//! impl (plus the identity). List the other params this one accesses: `&R` /
+//! `&mut R` is a read / write of resource `R` (a generic auto-scopes it into a
+//! `Part<R, T>` partition), and any other param has its footprint spliced in
+//! as-is.
 
 use proc_macro::TokenStream;
 use quote::{quote, quote_spanned};
@@ -103,36 +105,18 @@ fn scope(ty: &Type, generics: &[Ident]) -> proc_macro2::TokenStream {
     resource
 }
 
-/// Parsed form of `#[accesses(read(A, B), write(C, D))]`.
+/// Parsed form of `#[accesses(&R, &mut R, OtherParam, ...)]`: the flat list of
+/// params this one accesses.
 struct AccessSpec {
-    reads: Vec<Type>,
-    writes: Vec<Type>,
+    entries: Vec<Type>,
 }
 
 impl Parse for AccessSpec {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        let mut reads = Vec::new();
-        let mut writes = Vec::new();
-        while !input.is_empty() {
-            let kind: Ident = input.parse()?;
-            let content;
-            syn::parenthesized!(content in input);
-            let types = content.parse_terminated(Type::parse, Token![,])?;
-            match kind.to_string().as_str() {
-                "read" => reads.extend(types),
-                "write" => writes.extend(types),
-                other => {
-                    return Err(syn::Error::new(
-                        kind.span(),
-                        format!("expected `read(...)` or `write(...)`, found `{other}`"),
-                    ));
-                }
-            }
-            if input.peek(Token![,]) {
-                input.parse::<Token![,]>()?;
-            }
-        }
-        Ok(AccessSpec { reads, writes })
+        let entries = Punctuated::<Type, Token![,]>::parse_terminated(input)?
+            .into_iter()
+            .collect();
+        Ok(AccessSpec { entries })
     }
 }
 
@@ -155,10 +139,12 @@ pub fn derive_resource(input: TokenStream) -> TokenStream {
 /// generating its `Access` impl (plus the identity, so a param may also be
 /// named or nested like a resource).
 ///
-/// A parameter is the *verb*: declare what it touches with
-/// `#[accesses(read(A, B), write(C, D))]`. Each of the type's own generics
-/// scopes the resources that don't name it into `Part<R, G>` partitions, so
-/// `read(Storage)` on `Config<T>` reads just the `T`-partition of `Storage`.
+/// Declare the other params it accesses with `#[accesses(...)]`:
+/// - `&R` / `&mut R` — a read / write of resource `R`; each of the type's own
+///   generics auto-scopes it into a `Part<R, G>` partition (so `#[accesses(&Storage)]`
+///   on `Config<T>` reads just the `T`-partition of `Storage`).
+/// - any other param `P` — its own footprint is spliced in as-is.
+///
 /// For a plain data type that is only *accessed* (not a param), use
 /// `#[derive(Resource)]`.
 #[proc_macro_attribute]
@@ -170,20 +156,23 @@ pub fn accesses(attr: TokenStream, item: TokenStream) -> TokenStream {
     let identity = identity_impls(&input);
     let generic_idents = type_param_idents(&input.generics);
 
-    // Build the `Cons`/`Nil` access list, auto-scoping each declared resource
-    // into the param's own generics (reads first, then writes).
-    let mut items: Vec<proc_macro2::TokenStream> = Vec::new();
-    for r in &spec.reads {
-        let scoped = scope(r, &generic_idents);
-        items.push(quote! { ::params::Read<#scoped> });
-    }
-    for w in &spec.writes {
-        let scoped = scope(w, &generic_idents);
-        items.push(quote! { ::params::Write<#scoped> });
-    }
+    // Build the access list from the declared params. A `&R` / `&mut R` entry is
+    // a read / write of `R`, auto-scoped into the type's own generics; any other
+    // entry is a param whose own footprint is spliced in as-is.
     let mut list = quote! { ::params::Nil };
-    for marker in items.iter().rev() {
-        list = quote! { ::params::Cons<#marker, #list> };
+    for entry in spec.entries.iter().rev() {
+        if let Type::Reference(reference) = entry {
+            let scoped = scope(reference.elem.as_ref(), &generic_idents);
+            if reference.mutability.is_some() {
+                list = quote! { ::params::Cons<::params::Write<#scoped>, #list> };
+            } else {
+                list = quote! { ::params::Cons<::params::Read<#scoped>, #list> };
+            }
+        } else {
+            list = quote! {
+                <<#entry as ::params::Access>::Accesses as ::params::AccessList>::Concat<#list>
+            };
+        }
     }
 
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();

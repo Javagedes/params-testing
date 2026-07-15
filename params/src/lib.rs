@@ -39,13 +39,12 @@ mod tests {
     use crate::{Resource, accesses, has_conflict};
 
     // A *resource* is data (the noun) with a structural identity; a *param* is a
-    // request (the verb) that declares what it touches with
-    // `#[accesses(read(..), write(..))]`. `Storage` is data, requested by
-    // reference — `&Storage` (read) / `&mut Storage` (write) are params via a
-    // blanket impl — while `Config`/`ConfigMut`/`Hob` map onto a resource. A
-    // param's own generic auto-scopes a whole-resource access into a `Part<_, T>`
-    // partition, so `Config<KeyA>` and `Config<KeyB>` stay disjoint (the keys are
-    // themselves resources).
+    // request (the verb) that declares the other params it accesses with
+    // `#[accesses(...)]`. `&R` / `&mut R` are the base params (read / write of
+    // resource `R`); a param's own generic auto-scopes such an access into a
+    // `Part<R, T>` partition, so `Config<KeyA>` and `Config<KeyB>` stay disjoint
+    // (the keys are themselves resources). Listing another param instead splices
+    // in its footprint as-is.
 
     #[derive(Resource)]
     struct KeyA;
@@ -53,23 +52,36 @@ mod tests {
     #[derive(Resource)]
     struct KeyB;
 
+    // Has no accesses of its own, because it is the underlying storage for all other params.
     #[accesses]
     struct Storage;
 
-    #[accesses(write(Commands<'a>))]
+    // Example of a param that only conflicts with itself
+    #[accesses(&mut Self)]
     struct Commands<'a>(#[allow(dead_code)] &'a ());
 
-    #[accesses(read(Service<T>))]
+    // Example of a param that does not conflict with anything
+    #[accesses]
     struct Service<T>(#[allow(dead_code)] core::marker::PhantomData<T>);
 
-    #[accesses(read(Storage))]
+    // Example of a param that has read access to a partition of storage, scoped by its own generic
+    #[accesses(&Storage)]
     struct Config<T>(#[allow(dead_code)] core::marker::PhantomData<T>);
 
-    #[accesses(write(Storage))]
+    // Example of a param that has write access to a partition of storage, scoped by its own generic
+    #[accesses(&mut Storage)]
     struct ConfigMut<T>(#[allow(dead_code)] core::marker::PhantomData<T>);
 
-    #[accesses(read(Hob<T>))]
+    // Example of a param that does not conflict with anything
+    #[accesses]
     struct Hob<T>(#[allow(dead_code)] core::marker::PhantomData<T>);
+
+    // An example of a invalid param that conflicts with itself. Attempting to use it in a component will always fail to compile.
+    #[accesses(&'a mut Storage, ConfigMut<T>)]
+    struct Multi<'a, T>(
+        #[allow(dead_code)] core::marker::PhantomData<T>,
+        #[allow(dead_code)] &'a (),
+    );
 
     #[test]
     fn test_config_param_success_scenarios() {
@@ -92,6 +104,8 @@ mod tests {
 
         assert!(has_conflict::<(Config<KeyA>, ConfigMut<KeyA>)>());
         assert!(has_conflict::<(ConfigMut<KeyA>, Config<KeyA>)>());
+
+        assert!(has_conflict::<Multi<'_, KeyA>>());
     }
 
     #[test]
@@ -110,8 +124,11 @@ mod tests {
 
     #[test]
     fn test_commands_conflict_scenarios() {
-        // Commands should conflict with itself (Write<Commands> vs Write<Commands>).
+        // Commands writes its own resource, so it conflicts only with itself.
         assert!(has_conflict::<(Commands<'_>, Commands<'_>)>());
+
+        assert!(!has_conflict::<(Commands<'_>, Config<KeyA>)>());
+        assert!(!has_conflict::<(Commands<'_>, &mut Storage)>());
     }
 
     #[test]
