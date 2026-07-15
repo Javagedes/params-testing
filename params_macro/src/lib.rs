@@ -1,37 +1,20 @@
 //! Procedural macros for the `params` crate.
 //!
-//! `#[derive(Resource)]` gives a type a compile-time structural identity
-//! (the hidden `params::HasKey` + `params::HasPath` traits), derived from the
-//! type's name with every generic type parameter folded in — so `Foo<A>` and
-//! `Foo<B>` are distinct (each such parameter must itself have an identity).
+//! `#[accesses(...)]` is an attribute macro that generates a type's
+//! `params::Access` impl plus its `params::HasPath` (containment) identity.
+//! List the other params this one accesses: `&R` / `&mut R` is a read / write of
+//! resource `R` (a generic auto-scopes it into a `Part<R, T>` partition), and
+//! any other param has its footprint spliced in as-is.
 //!
-//! `#[accesses(...)]` is an attribute macro that generates the `params::Access`
-//! impl (plus the identity). List the other params this one accesses: `&R` /
-//! `&mut R` is a read / write of resource `R` (a generic auto-scopes it into a
-//! `Part<R, T>` partition), and any other param has its footprint spliced in
-//! as-is.
+//! Type *equality* is decided at compile time from `type_name` (see
+//! `params::KeyEq`), so there is no separate key derive.
 
 use proc_macro::TokenStream;
 use quote::{quote, quote_spanned};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
-use syn::{
-    DeriveInput, GenericParam, Generics, Ident, Token, Type, parse_macro_input, parse_quote,
-};
-
-/// FNV-1a 64-bit hash of a type's name. Distinct names almost always hash to
-/// distinct values, which is what lets two identities be compared with a single
-/// `==` on a `u64` const generic. Shared by every entry point so they all agree
-/// on identity.
-fn hash_name(name: &str) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in name.bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
+use syn::{DeriveInput, GenericParam, Generics, Ident, Token, Type, parse_macro_input};
 
 /// The identifiers of a type's generic *type* parameters (lifetimes and consts
 /// skipped), in declaration order.
@@ -46,35 +29,15 @@ fn type_param_idents(generics: &Generics) -> Vec<Ident> {
         .collect()
 }
 
-/// Generates the identity impls (`HasKey` + `HasPath`) for a type, folding every
-/// generic type parameter into the key so `Foo<A>` and `Foo<B>` are distinct
-/// (each such parameter must itself have an identity / `HasKey`).
-fn identity_impls(input: &DeriveInput) -> proc_macro2::TokenStream {
+/// Generates a type's `HasPath` impl — its containment path is just itself
+/// (`PCons<Self, PNil>`); `Part<_, _>` extends it. Type equality of path
+/// elements comes from `type_name` (`params::KeyEq`), so no key is generated.
+fn has_path_impl(input: &DeriveInput) -> proc_macro2::TokenStream {
     let name = &input.ident;
-    let name_hash = hash_name(&name.to_string());
-
-    let type_params = type_param_idents(&input.generics);
-
-    let mut args = quote! { ::params::ANil };
-    for tp in type_params.iter().rev() {
-        args = quote! { ::params::ACons<<#tp as ::params::HasKey>::Key, #args> };
-    }
-
-    let mut generics = input.generics.clone();
-    for param in &mut generics.params {
-        if let GenericParam::Type(t) = param {
-            t.bounds.push(parse_quote!(::params::HasKey));
-        }
-    }
-    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-    let self_key = quote! { ::params::Sig<#name_hash, #args> };
-
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
     quote! {
-        impl #impl_generics ::params::HasKey for #name #ty_generics #where_clause {
-            type Key = #self_key;
-        }
         impl #impl_generics ::params::HasPath for #name #ty_generics #where_clause {
-            type Path = ::params::PCons<#self_key, ::params::PNil>;
+            type Path = ::params::PCons<#name #ty_generics, ::params::PNil>;
         }
     }
 }
@@ -120,24 +83,8 @@ impl Parse for AccessSpec {
     }
 }
 
-/// Marks a type as a **resource** — a unit of data the conflict checker can
-/// reason about — by giving it a structural identity (`HasKey` + `HasPath`) and
-/// nothing else.
-///
-/// A resource is the *noun*; it declares no accesses of its own. It is
-/// *requested* by reference — the blanket `impl Access for &R` / `&mut R`
-/// makes `&Storage` a read and `&mut Storage` a write of it — or through a param
-/// that names it (e.g. a `Config<T>` reading a `Part<Storage, T>`). For a type
-/// that is itself a parameter, use `#[accesses(...)]` instead.
-#[proc_macro_derive(Resource)]
-pub fn derive_resource(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
-    identity_impls(&input).into()
-}
-
 /// Marks a type as a **parameter** — something a function requests — by
-/// generating its `Access` impl (plus the identity, so a param may also be
-/// named or nested like a resource).
+/// generating its `Access` impl plus its `HasPath` identity.
 ///
 /// Declare the other params it accesses with `#[accesses(...)]`:
 /// - `&R` / `&mut R` — a read / write of resource `R`; each of the type's own
@@ -145,15 +92,15 @@ pub fn derive_resource(input: TokenStream) -> TokenStream {
 ///   on `Config<T>` reads just the `T`-partition of `Storage`).
 /// - any other param `P` — its own footprint is spliced in as-is.
 ///
-/// For a plain data type that is only *accessed* (not a param), use
-/// `#[derive(Resource)]`.
+/// An empty `#[accesses]` gives a resource its `HasPath` identity with no
+/// accesses of its own.
 #[proc_macro_attribute]
 pub fn accesses(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as DeriveInput);
     let spec = parse_macro_input!(attr as AccessSpec);
     let name = &input.ident;
 
-    let identity = identity_impls(&input);
+    let has_path = has_path_impl(&input);
     let generic_idents = type_param_idents(&input.generics);
 
     // Build the access list from the declared params. A `&R` / `&mut R` entry is
@@ -180,7 +127,7 @@ pub fn accesses(attr: TokenStream, item: TokenStream) -> TokenStream {
     quote! {
         #input
 
-        #identity
+        #has_path
 
         impl #impl_generics ::params::Access for #name #ty_generics #where_clause {
             type Accesses = #list;

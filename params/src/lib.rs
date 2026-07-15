@@ -1,3 +1,5 @@
+#![feature(const_type_name)]
+
 mod conflict_check;
 mod hlist;
 mod param;
@@ -11,7 +13,7 @@ extern crate self as params;
 // -------------------------------------------------------------------------
 pub use conflict_check::{Part, Read, Write};
 pub use param::Access;
-pub use params_macro::{Resource, accesses, assert_no_conflicts};
+pub use params_macro::{accesses, assert_no_conflicts};
 
 /// Returns `true` iff `P`'s flattened access list contains a conflict.
 pub const fn has_conflict<P>() -> bool
@@ -22,13 +24,12 @@ where
     !<<P as Access>::Accesses as NoConflicts>::VALUE
 }
 
-// Hidden plumbing: reachable because the `#[accesses(...)]` / `#[derive(Resource)]`
-// output and the `assert_no_conflicts` bound need to name it, but not part of the
-// intended public API.
+// Hidden plumbing: reachable because the `#[accesses(...)]` output and the
+// `assert_no_conflicts` bound need to name it, but not part of the intended
+// public API.
 #[doc(hidden)]
 pub use conflict_check::{
-    ACons, ANil, AnyConflict, ConflictsWith, HasKey, HasPath, KeyEq, NoConflicts, PCons, PNil,
-    PathList, PathOverlap, Sig,
+    AnyConflict, ConflictsWith, HasPath, KeyEq, NoConflicts, PCons, PNil, PathList, PathOverlap,
 };
 #[doc(hidden)]
 pub use hlist::{AccessList, Cons, Nil};
@@ -36,20 +37,10 @@ pub use hlist::{AccessList, Cons, Nil};
 #[cfg(test)]
 mod tests {
     #![allow(dead_code)]
-    use crate::{Resource, accesses, has_conflict};
+    use crate::{accesses, has_conflict};
 
-    // A *resource* is data (the noun) with a structural identity; a *param* is a
-    // request (the verb) that declares the other params it accesses with
-    // `#[accesses(...)]`. `&R` / `&mut R` are the base params (read / write of
-    // resource `R`); a param's own generic auto-scopes such an access into a
-    // `Part<R, T>` partition, so `Config<KeyA>` and `Config<KeyB>` stay disjoint
-    // (the keys are themselves resources). Listing another param instead splices
-    // in its footprint as-is.
-
-    #[derive(Resource)]
     struct KeyA;
 
-    #[derive(Resource)]
     struct KeyB;
 
     // Has no accesses of its own, because it is the underlying storage for all other params.
